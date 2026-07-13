@@ -434,12 +434,27 @@ export class RailwaySandbox extends MastraSandbox {
           }
         },
         error => {
-          // Stop the loop on failure (the VM may be gone); the next real
-          // action restarts the sandbox via `withRestartRetry` and reschedules.
           this.logger.warn(
             `${LOG_PREFIX} Failed to refresh Railway sandbox checkpoint ${this._checkpointName}:`,
             error,
           );
+          // When the failure means the VM is gone or no longer running (the
+          // idle destroy raced the ping, or the timer fired late — e.g. after
+          // host sleep), recover instead of leaving the workspace wedged:
+          // `restart()` reconnects and, when the VM is dead, re-creates it
+          // restored from the latest checkpoint, then reschedules this loop.
+          // Any other failure stops the loop; the next real action restarts
+          // the sandbox via `withRestartRetry` and reschedules.
+          if (!this._sandbox || !this._isRecoverableRefreshError(error)) {
+            return;
+          }
+          this.logger.info(`${LOG_PREFIX} Recovering Railway sandbox from checkpoint ${this._checkpointName}...`);
+          void this.restart().catch(restartError => {
+            this.logger.warn(
+              `${LOG_PREFIX} Failed to recover Railway sandbox from checkpoint ${this._checkpointName}:`,
+              restartError,
+            );
+          });
         },
       );
     }, delayMs);
@@ -474,6 +489,22 @@ export class RailwaySandbox extends MastraSandbox {
     if (this._sandbox) {
       await this._checkpointSandbox(this._sandbox);
     }
+  }
+
+  /**
+   * True for keepalive-refresh failures where the VM is gone or not running —
+   * including Railway's "Can only checkpoint a running sandbox" GraphQL error
+   * — so a restart (restore from checkpoint) can recover it.
+   */
+  private _isRecoverableRefreshError(error: unknown): boolean {
+    if (this.isSandboxUnavailableError(error)) {
+      return true;
+    }
+    if (!(error instanceof Error)) {
+      return false;
+    }
+    const message = error.message.toLowerCase();
+    return message.includes('checkpoint') && message.includes('running sandbox');
   }
 
   private isCheckpointUnavailableError(error: unknown): boolean {
