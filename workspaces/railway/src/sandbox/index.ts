@@ -221,6 +221,15 @@ export class RailwaySandbox extends MastraSandbox {
     try {
       await this._startRailwaySandbox({ reconnectSandboxId, fallbackToCreate: true });
       this.status = 'running';
+      if (reconnectSandboxId && this._sandbox && (this._sandbox as Sandbox).id !== reconnectSandboxId) {
+        // The old VM was gone — a replacement was created (restored from the
+        // checkpoint when one existed). Callers tracking the provider id
+        // (e.g. a persisted binding) now reference a dead sandbox.
+        this.logger.info(
+          `${LOG_PREFIX} Sandbox ${reconnectSandboxId} was replaced by ${(this._sandbox as Sandbox).id}` +
+            (this._checkpointName ? ` (restored from checkpoint ${this._checkpointName}).` : '.'),
+        );
+      }
     } catch (error) {
       this.status = 'error';
       throw error;
@@ -236,6 +245,10 @@ export class RailwaySandbox extends MastraSandbox {
         throw error;
       }
 
+      this.logger.warn(
+        `${LOG_PREFIX} Sandbox ${this._sandbox?.id ?? this._sandboxId ?? this.id} became unavailable mid-operation; restarting and retrying:`,
+        error,
+      );
       await this.restart();
       return await operation();
     } finally {
@@ -281,9 +294,14 @@ export class RailwaySandbox extends MastraSandbox {
       if (!fallbackToCreate || !this.isSandboxUnavailableError(error)) {
         throw error;
       }
+      this.logger.debug(
+        `${LOG_PREFIX} Could not connect to Railway sandbox ${reconnectSandboxId}; creating a replacement:`,
+        error,
+      );
       return this._createNewSandbox(createOptions);
     }
 
+    this.logger.debug(`${LOG_PREFIX} Railway sandbox ${reconnectSandboxId} status: ${connectedSandbox.status}`);
     if (connectedSandbox.status === 'RUNNING') {
       return connectedSandbox;
     }
@@ -410,11 +428,27 @@ export class RailwaySandbox extends MastraSandbox {
     }
 
     const delayMs = Math.max(1_000, idleTimeoutMinutes * 60_000 - 10_000);
+    const scheduledAt = Date.now();
+    this.logger.debug(
+      `${LOG_PREFIX} Scheduled keepalive+checkpoint refresh for ${this._checkpointName} in ${Math.round(delayMs / 1000)}s ` +
+        `(sandbox ${this._sandbox.id}, idle window ${idleTimeoutMinutes}m).`,
+    );
     this._checkpointRefreshTimer = setTimeout(() => {
       this._checkpointRefreshTimer = null;
       const sandbox = this._sandbox;
       if (!sandbox) {
         return;
+      }
+
+      // A timer that fires much later than scheduled (host sleep, stalled
+      // event loop) means the idle window may have already closed and the VM
+      // been reclaimed — the most common cause of refresh failures.
+      const lateMs = Date.now() - scheduledAt - delayMs;
+      if (lateMs > 5_000) {
+        this.logger.warn(
+          `${LOG_PREFIX} Keepalive timer for ${this._checkpointName} fired ${Math.round(lateMs / 1000)}s late ` +
+            `(host slept or event loop stalled); sandbox ${sandbox.id} may already be reclaimed.`,
+        );
       }
 
       const refresh = this._keepAliveAndCheckpoint(sandbox).finally(() => {
@@ -464,11 +498,39 @@ export class RailwaySandbox extends MastraSandbox {
   /**
    * Ping the sandbox to reset Railway's idle-destroy clock, then capture a
    * fresh checkpoint. The ping runs first so the VM cannot be reclaimed while
-   * the (potentially slow) checkpoint capture is in flight.
+   * the (potentially slow) checkpoint capture is in flight. Between the two,
+   * the live status is re-fetched: when the idle destroy raced the ping the
+   * sandbox is no longer RUNNING, and failing here with a recognizable
+   * "not running" error routes straight into checkpoint recovery instead of
+   * surfacing Railway's "Can only checkpoint a running sandbox" GraphQL error.
    */
   private async _keepAliveAndCheckpoint(sandbox: Sandbox): Promise<void> {
+    const pingStart = Date.now();
     await sandbox.exec('true');
+    this.logger.debug(
+      `${LOG_PREFIX} Keepalive ping for sandbox ${sandbox.id} ok in ${Date.now() - pingStart}ms; checking status...`,
+    );
+
+    // Re-fetch the live status before checkpointing. A refresh failure is not
+    // conclusive (transient API error) — log and let the checkpoint attempt
+    // produce the authoritative outcome.
+    try {
+      const status = (await sandbox.refresh()).status;
+      if (status !== 'RUNNING') {
+        throw new Error(`Railway sandbox ${sandbox.id} is not running (status: ${status})`);
+      }
+    } catch (error) {
+      if (this.isSandboxUnavailableError(error)) {
+        throw error;
+      }
+      this.logger.debug(`${LOG_PREFIX} Could not refresh sandbox ${sandbox.id} status; attempting checkpoint:`, error);
+    }
+
+    const checkpointStart = Date.now();
     await this._checkpointSandbox(sandbox);
+    this.logger.debug(
+      `${LOG_PREFIX} Checkpoint ${this._checkpointName} captured for sandbox ${sandbox.id} in ${Date.now() - checkpointStart}ms.`,
+    );
   }
 
   private _cancelCheckpointRefresh(): void {

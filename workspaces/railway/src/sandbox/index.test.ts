@@ -87,8 +87,11 @@ const {
     ),
     fork: vi.fn().mockResolvedValue(mockForkedSandbox),
     checkpoint: vi.fn().mockResolvedValue({ id: 'checkpoint-1', key: 'checkpoint-1', environmentId: 'env-1' }),
+    refresh: vi.fn(),
     destroy: vi.fn().mockResolvedValue(undefined),
   };
+  // refresh() re-fetches live state; the mock just returns itself (RUNNING).
+  mockSandbox.refresh.mockResolvedValue(mockSandbox);
 
   // Chainable template builder mock.
   const mockTemplate = {
@@ -185,6 +188,7 @@ describe('RailwaySandbox', () => {
       .mockReset()
       .mockResolvedValue({ id: 'checkpoint-1', key: 'checkpoint-1', environmentId: 'env-1' });
     mockSandbox.destroy.mockReset().mockResolvedValue(undefined);
+    mockSandbox.refresh.mockReset().mockResolvedValue(mockSandbox);
     mockSandbox.exec.mockImplementation((_command: string, options?: { onStdout?: (c: string) => void }) =>
       makeExecHandle({ exitCode: 0, stdout: 'ok' }, options),
     );
@@ -485,6 +489,55 @@ describe('RailwaySandbox', () => {
       // ...and the refresh loop keeps going on the restored VM.
       await vi.advanceTimersByTimeAsync(50_000);
       expect(mockSandbox.checkpoint).toHaveBeenCalledTimes(3);
+    });
+
+    it('detects a raced idle-destroy via the status re-fetch and recovers before checkpointing', async () => {
+      vi.useFakeTimers();
+      mockCreate.mockRejectedValueOnce(new Error('checkpoint not found')).mockResolvedValueOnce(mockSandbox);
+
+      const sandbox = new RailwaySandbox({
+        token: 'tok',
+        checkpointName: 'mastracode-repo-abc123',
+        idleTimeoutMinutes: 1,
+        template: t => t.run('npm i -g pnpm'),
+      });
+      await sandbox._start();
+      expect(mockSandbox.checkpoint).toHaveBeenCalledTimes(1);
+      mockCreate.mockClear();
+
+      // The ping went through, but the refresh reveals the VM is DESTROYING —
+      // no checkpoint attempt is made against a non-running sandbox.
+      mockSandbox.refresh.mockResolvedValueOnce({ ...mockSandbox, status: 'DESTROYING' });
+      mockConnect.mockResolvedValueOnce({ ...mockSandbox, status: 'DESTROYED' });
+
+      await vi.advanceTimersByTimeAsync(50_000);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // No extra checkpoint call on the dead VM; recovery restored from the
+      // checkpoint instead.
+      expect(mockSandbox.checkpoint).toHaveBeenCalledTimes(1);
+      expect(mockCreate).toHaveBeenCalledWith('mastracode-repo-abc123', expect.objectContaining({ token: 'tok' }));
+      expect(sandbox.status).toBe('running');
+    });
+
+    it('proceeds to checkpoint when the status re-fetch itself fails transiently', async () => {
+      vi.useFakeTimers();
+      mockCreate.mockRejectedValueOnce(new Error('checkpoint not found')).mockResolvedValueOnce(mockSandbox);
+
+      const sandbox = new RailwaySandbox({
+        token: 'tok',
+        checkpointName: 'mastracode-repo-abc123',
+        idleTimeoutMinutes: 1,
+        template: t => t.run('npm i -g pnpm'),
+      });
+      await sandbox._start();
+      expect(mockSandbox.checkpoint).toHaveBeenCalledTimes(1);
+
+      mockSandbox.refresh.mockRejectedValueOnce(new MockRailwayConnectionError('api hiccup'));
+      await vi.advanceTimersByTimeAsync(50_000);
+
+      // A transient refresh error is inconclusive — the checkpoint still runs.
+      expect(mockSandbox.checkpoint).toHaveBeenCalledTimes(2);
     });
 
     it('recovers by reconnecting when the keepalive ping fails but the VM still exists', async () => {
