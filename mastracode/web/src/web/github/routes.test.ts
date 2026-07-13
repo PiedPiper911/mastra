@@ -97,7 +97,7 @@ const listRepoOpenPullRequests = vi.fn(async (_installationId: number, _repoFull
 vi.mock('./client', () => ({
   buildInstallUrl: (state: string) => `https://github.com/apps/test/installations/new?state=${state}`,
   buildOAuthIdentifyUrl: (state: string) => `https://github.com/login/oauth/authorize?state=${state}`,
-  exchangeOAuthCode: vi.fn(async () => ({ accessToken: 'user-token' })),
+  exchangeOAuthCode: vi.fn(async () => 'user-token'),
   getAuthenticatedGithubUser: vi.fn(async () => ({ login: 'octocat', name: 'Octo Cat', email: null })),
   listUserInstallations: vi.fn(async () => [{ installationId: 7, accountLogin: 'octo', accountType: 'User' }]),
   listInstallationRepos: vi.fn(async () => [
@@ -148,15 +148,15 @@ const ensureWorktree = vi.fn(async (_sb: any, _workdir: string, opts: { branch: 
 const commitAll = vi.fn(async () => ({ committed: true }));
 const pushBranch = vi.fn(async () => {});
 const createPullRequest = vi.fn(async () => ({ url: 'https://github.com/octo/hello/pull/1' }));
-const configureSandboxUserAuth = vi.fn(async () => {});
+const configureSandboxGitAuth = vi.fn(async () => {});
 let sandboxEnabled = true;
 
-// User-token store: null (no connected GitHub identity) unless a test sets it.
-const getFreshUserToken = vi.fn(async (_userId: string): Promise<any> => null);
-const saveUserToken = vi.fn(async () => {});
-vi.mock('./user-token', () => ({
-  getFreshUserToken: (userId: string) => getFreshUserToken(userId),
-  saveUserToken: (...args: any[]) => (saveUserToken as any)(...args),
+// Identity store: null (no connected GitHub identity) unless a test sets it.
+const getUserIdentity = vi.fn(async (_userId: string): Promise<any> => null);
+const saveUserIdentity = vi.fn(async () => {});
+vi.mock('./user-identity', () => ({
+  getUserIdentity: (userId: string) => getUserIdentity(userId),
+  saveUserIdentity: (...args: any[]) => (saveUserIdentity as any)(...args),
 }));
 vi.mock('./sandbox', () => {
   class MaterializeError extends Error {
@@ -184,7 +184,7 @@ vi.mock('./sandbox', () => {
     commitAll: (...args: any[]) => commitAll(...(args as [])),
     pushBranch: (...args: any[]) => pushBranch(...(args as [])),
     createPullRequest: (...args: any[]) => createPullRequest(...(args as [])),
-    configureSandboxUserAuth: (...args: any[]) => (configureSandboxUserAuth as any)(...args),
+    configureSandboxGitAuth: (...args: any[]) => (configureSandboxGitAuth as any)(...args),
     // Match the real ref validator closely enough for route tests.
     isValidGitRef: (v: unknown): v is string =>
       typeof v === 'string' && v.length > 0 && v.length <= 255 && /^[A-Za-z0-9_./-]+$/.test(v),
@@ -350,9 +350,9 @@ beforeEach(() => {
   createPullRequest.mockClear();
   listRepoOpenIssues.mockClear();
   listRepoOpenPullRequests.mockClear();
-  configureSandboxUserAuth.mockClear();
-  getFreshUserToken.mockClear().mockResolvedValue(null);
-  saveUserToken.mockClear();
+  configureSandboxGitAuth.mockClear();
+  getUserIdentity.mockClear().mockResolvedValue(null);
+  saveUserIdentity.mockClear();
 });
 
 afterEach(() => {
@@ -545,19 +545,15 @@ describe('connect + callback', () => {
     expect(tables.installations).toHaveLength(1);
   });
 
-  it('persists the user token + GitHub identity on a valid callback', async () => {
+  it('persists the GitHub identity (no token) on a valid callback', async () => {
     const res = await buildApp({ workosId: 'u1' }).request('/auth/github/callback?state=state.org1.u1&code=abc');
     expect(res.headers.get('location')).toBe('/?github=connected');
-    expect(saveUserToken).toHaveBeenCalledWith(
-      'u1',
-      { accessToken: 'user-token' },
-      { login: 'octocat', name: 'Octo Cat', email: null },
-    );
+    expect(saveUserIdentity).toHaveBeenCalledWith('u1', { login: 'octocat', name: 'Octo Cat', email: null });
   });
 
-  it('still connects when persisting the user token fails', async () => {
+  it('still connects when persisting the GitHub identity fails', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
-    saveUserToken.mockRejectedValueOnce(new Error('db down'));
+    saveUserIdentity.mockRejectedValueOnce(new Error('db down'));
     const res = await buildApp({ workosId: 'u1' }).request('/auth/github/callback?state=state.org1.u1&code=abc');
     expect(res.headers.get('location')).toBe('/?github=connected');
     expect(tables.installations).toHaveLength(1);
@@ -1016,19 +1012,6 @@ describe('push route', () => {
     expect(call[3]).toBe('install-token');
     expect(call[4]).toBe('octo/hello');
   });
-
-  it('pushes with the user token when one is stored', async () => {
-    seedMaterializedProject();
-    getFreshUserToken.mockResolvedValue({
-      token: 'ghu_user',
-      identity: { login: 'octocat', name: 'Octo Cat', email: null },
-    });
-    const res = await postJson(buildApp({ workosId: 'u1' }), '/web/github/projects/p1/push', {
-      branch: 'feat/x',
-    });
-    expect(res.status).toBe(200);
-    expect((pushBranch.mock.calls[0] as unknown as any[])[3]).toBe('ghu_user');
-  });
 });
 
 describe('pr route', () => {
@@ -1065,21 +1048,6 @@ describe('pr route', () => {
     const opts = (createPullRequest.mock.calls[0] as unknown as any[])[2];
     expect(opts).toMatchObject({ token: 'install-token', base: 'main', head: 'feat/x', title: 'My PR' });
   });
-
-  it('opens the PR as the user when a token is stored', async () => {
-    seedMaterializedProject();
-    getFreshUserToken.mockResolvedValue({
-      token: 'ghu_user',
-      identity: { login: 'octocat', name: 'Octo Cat', email: null },
-    });
-    const res = await postJson(buildApp({ workosId: 'u1' }), '/web/github/projects/p1/pr', {
-      branch: 'feat/x',
-      title: 'My PR',
-    });
-    expect(res.status).toBe(200);
-    const opts = (createPullRequest.mock.calls[0] as unknown as any[])[2];
-    expect(opts).toMatchObject({ token: 'ghu_user' });
-  });
 });
 
 describe('acting as the user', () => {
@@ -1097,10 +1065,7 @@ describe('acting as the user', () => {
 
   it('commits with the stored GitHub identity instead of the WorkOS profile', async () => {
     seedMaterializedProject();
-    getFreshUserToken.mockResolvedValue({
-      token: 'ghu_user',
-      identity: { login: 'octocat', name: 'Octo Cat', email: null },
-    });
+    getUserIdentity.mockResolvedValue({ login: 'octocat', name: 'Octo Cat', email: null });
     const res = await postJson(buildApp({ workosId: 'u1' }), '/web/github/projects/p1/commit', {
       message: 'wip',
     });
@@ -1112,35 +1077,31 @@ describe('acting as the user', () => {
     });
   });
 
-  it('injects sandbox user auth during ensure when a token is stored', async () => {
+  it('injects sandbox git auth with the installation token during ensure', async () => {
     seedProject();
-    getFreshUserToken.mockResolvedValue({
-      token: 'ghu_user',
-      identity: { login: 'octocat', name: 'Octo Cat', email: null },
-    });
+    getUserIdentity.mockResolvedValue({ login: 'octocat', name: 'Octo Cat', email: null });
     const res = await postJson(buildApp({ workosId: 'u1' }), '/web/github/projects/p1/ensure', {});
     expect(res.status).toBe(200);
-    expect(configureSandboxUserAuth).toHaveBeenCalledOnce();
-    const call = configureSandboxUserAuth.mock.calls[0] as unknown as any[];
-    expect(call[1]).toBe('ghu_user');
+    expect(configureSandboxGitAuth).toHaveBeenCalledOnce();
+    const call = configureSandboxGitAuth.mock.calls[0] as unknown as any[];
+    expect(call[1]).toBe('install-token');
     expect(call[2]).toEqual({ login: 'octocat', name: 'Octo Cat', email: null });
   });
 
-  it('ensure succeeds without sandbox auth when no token is stored', async () => {
+  it('injects sandbox git auth even when no GitHub identity is stored', async () => {
     seedProject();
     const res = await postJson(buildApp({ workosId: 'u1' }), '/web/github/projects/p1/ensure', {});
     expect(res.status).toBe(200);
-    expect(configureSandboxUserAuth).not.toHaveBeenCalled();
+    expect(configureSandboxGitAuth).toHaveBeenCalledOnce();
+    const call = configureSandboxGitAuth.mock.calls[0] as unknown as any[];
+    expect(call[1]).toBe('install-token');
+    expect(call[2]).toEqual({});
   });
 
-  it('ensure succeeds even when sandbox auth injection fails', async () => {
+  it('ensure succeeds even when git auth injection fails', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     seedProject();
-    getFreshUserToken.mockResolvedValue({
-      token: 'ghu_user',
-      identity: { login: 'octocat', name: 'Octo Cat', email: null },
-    });
-    configureSandboxUserAuth.mockRejectedValueOnce(new Error('vm exploded'));
+    configureSandboxGitAuth.mockRejectedValueOnce(new Error('vm exploded'));
     const res = await postJson(buildApp({ workosId: 'u1' }), '/web/github/projects/p1/ensure', {});
     expect(res.status).toBe(200);
   });

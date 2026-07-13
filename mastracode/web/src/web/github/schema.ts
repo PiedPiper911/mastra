@@ -125,14 +125,14 @@ export const githubWorktrees = pgTable(
 );
 
 /**
- * The GitHub user-to-server token of a user who connected GitHub. One row per
- * WorkOS user (a GitHub identity is user-global, not org-scoped). The token is
- * used to act *as the user* — pushes, PRs, in-sandbox git/gh credentials — with
- * installation tokens as the fallback. `refresh_token`/expiries are null when
- * the GitHub App has token expiration disabled.
+ * The GitHub identity of a user who connected GitHub, captured during the
+ * OAuth identify step. One row per WorkOS user (a GitHub identity is
+ * user-global, not org-scoped). No tokens are stored — all git writes use
+ * short-lived installation tokens; this identity only makes commits *author*
+ * as the user (GitHub attribution keys off the commit author email).
  */
-export const githubUserTokens = pgTable(
-  'github_user_tokens',
+export const githubUserIdentities = pgTable(
+  'github_user_identities',
   {
     id: uuid('id').primaryKey().defaultRandom(),
     /** Owning WorkOS user id. */
@@ -143,26 +143,18 @@ export const githubUserTokens = pgTable(
     githubName: text('github_name'),
     /** Public profile email (nullable on GitHub). */
     githubEmail: text('github_email'),
-    /** User-to-server access token. */
-    accessToken: text('access_token').notNull(),
-    /** Refresh token; null when the App has token expiration disabled. */
-    refreshToken: text('refresh_token'),
-    /** Access-token expiry; null when non-expiring. */
-    tokenExpiresAt: timestamp('token_expires_at', { withTimezone: true }),
-    /** Refresh-token expiry; null when non-expiring. */
-    refreshTokenExpiresAt: timestamp('refresh_token_expires_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  table => [uniqueIndex('github_user_tokens_user_unique').on(table.userId)],
+  table => [uniqueIndex('github_user_identities_user_unique').on(table.userId)],
 );
 
 export type GithubInstallationRow = typeof githubInstallations.$inferSelect;
 export type GithubProjectRow = typeof githubProjects.$inferSelect;
 export type GithubProjectSandboxRow = typeof githubProjectSandboxes.$inferSelect;
 export type GithubWorktreeRow = typeof githubWorktrees.$inferSelect;
-export type GithubUserTokenRow = typeof githubUserTokens.$inferSelect;
-export type NewGithubUserTokenRow = typeof githubUserTokens.$inferInsert;
+export type GithubUserIdentityRow = typeof githubUserIdentities.$inferSelect;
+export type NewGithubUserIdentityRow = typeof githubUserIdentities.$inferInsert;
 export type NewGithubInstallationRow = typeof githubInstallations.$inferInsert;
 export type NewGithubProjectRow = typeof githubProjects.$inferInsert;
 export type NewGithubProjectSandboxRow = typeof githubProjectSandboxes.$inferInsert;
@@ -240,20 +232,20 @@ ALTER TABLE github_worktrees ADD COLUMN IF NOT EXISTS org_id text;
 CREATE UNIQUE INDEX IF NOT EXISTS github_worktrees_project_user_branch_unique
   ON github_worktrees (github_project_id, user_id, branch);
 
-CREATE TABLE IF NOT EXISTS github_user_tokens (
+CREATE TABLE IF NOT EXISTS github_user_identities (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id text NOT NULL,
   github_login text NOT NULL,
   github_name text,
   github_email text,
-  access_token text NOT NULL,
-  refresh_token text,
-  token_expires_at timestamptz,
-  refresh_token_expires_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS github_user_tokens_user_unique
-  ON github_user_tokens (user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS github_user_identities_user_unique
+  ON github_user_identities (user_id);
+
+-- github_user_tokens existed briefly (never released) and held plaintext user
+-- tokens; drop it so no stored secrets linger.
+DROP TABLE IF EXISTS github_user_tokens;
 `;

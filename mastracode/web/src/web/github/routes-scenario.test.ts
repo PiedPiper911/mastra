@@ -62,7 +62,7 @@ vi.mock('./db', () => {
 vi.mock('./client', () => ({
   buildInstallUrl: (state: string) => `https://github.com/apps/test/installations/new?state=${state}`,
   buildOAuthIdentifyUrl: (state: string) => `https://github.com/login/oauth/authorize?state=${state}`,
-  exchangeOAuthCode: vi.fn(async () => ({ accessToken: 'user-token' })),
+  exchangeOAuthCode: vi.fn(async () => 'user-token'),
   getAuthenticatedGithubUser: vi.fn(async () => ({ login: 'octocat', name: 'Octo Cat', email: null })),
   listUserInstallations: vi.fn(async () => [{ installationId: 7, accountLogin: 'octo', accountType: 'User' }]),
   listInstallationRepos: vi.fn(async () => [
@@ -109,9 +109,9 @@ let pushImpl: (...args: any[]) => Promise<void> = async () => {};
 const pushBranch = vi.fn((...args: any[]) => pushImpl(...args));
 const createPullRequest = vi.fn(async () => ({ url: 'https://github.com/octo/hello/pull/1' }));
 let sandboxEnabled = true;
-vi.mock('./user-token', () => ({
-  getFreshUserToken: vi.fn(async () => null),
-  saveUserToken: vi.fn(async () => {}),
+vi.mock('./user-identity', () => ({
+  getUserIdentity: vi.fn(async () => null),
+  saveUserIdentity: vi.fn(async () => {}),
 }));
 vi.mock('./sandbox', () => {
   class MaterializeError extends Error {
@@ -139,7 +139,7 @@ vi.mock('./sandbox', () => {
     commitAll: (...args: any[]) => commitAll(...(args as [])),
     pushBranch: (...args: any[]) => pushBranch(...(args as [])),
     createPullRequest: (...args: any[]) => createPullRequest(...(args as [])),
-    configureSandboxUserAuth: vi.fn(async () => {}),
+    configureSandboxGitAuth: vi.fn(async () => {}),
     isValidGitRef: (v: unknown): v is string =>
       typeof v === 'string' && v.length > 0 && v.length <= 255 && /^[A-Za-z0-9_./-]+$/.test(v),
     MaterializeError,

@@ -50,7 +50,7 @@ import { withProjectLock } from './project-lock';
 import {
   commitAll,
   computeSandboxWorkdir,
-  configureSandboxUserAuth,
+  configureSandboxGitAuth,
   createPullRequest,
   ensureProjectSandbox,
   ensureWorktree,
@@ -68,7 +68,7 @@ import {
 import type { GitIdentity, MaterializationSandbox, PrepareProgress, ProgressFn } from './sandbox';
 import { githubInstallations, githubProjects, githubProjectSandboxes, githubWorktrees } from './schema';
 import type { GithubProjectRow, GithubProjectSandboxRow } from './schema';
-import { getFreshUserToken, saveUserToken } from './user-token';
+import { getUserIdentity, saveUserIdentity } from './user-identity';
 
 export interface MountGithubRoutesOptions {
   /**
@@ -296,18 +296,18 @@ export function buildGithubRoutes(options: MountGithubRoutesOptions = {}): ApiRo
         }
 
         try {
-          const tokenSet = await exchangeOAuthCode(code, redirectUri);
-          // Persist the user token + GitHub identity so git writes (pushes,
-          // PRs, in-sandbox credentials) can act as the user. Best-effort: a
-          // failure here must not break connecting — everything that uses the
-          // user token falls back to installation tokens.
+          const userToken = await exchangeOAuthCode(code, redirectUri);
+          // Persist the GitHub identity (no tokens) so commits can be authored
+          // — and attributed on GitHub — as the user. Best-effort: a failure
+          // here must not break connecting; commits fall back to the WorkOS
+          // profile identity.
           try {
-            const profile = await getAuthenticatedGithubUser(tokenSet.accessToken);
-            await saveUserToken(userId, tokenSet, profile);
+            const profile = await getAuthenticatedGithubUser(userToken);
+            await saveUserIdentity(userId, profile);
           } catch (error) {
-            console.warn(`[GitHub] Failed to persist user token for ${userId}; git writes will use the app.`, error);
+            console.warn(`[GitHub] Failed to persist GitHub identity for ${userId}.`, error);
           }
-          const installations = await listUserInstallations(tokenSet.accessToken);
+          const installations = await listUserInstallations(userToken);
           if (installations.length === 0) {
             // Verified user has no installations yet — send them to the actual
             // install page. After installing, GitHub redirects back here with
@@ -682,18 +682,16 @@ async function prepareProject(
     token,
     onProgress,
   );
-  // Authenticate the sandbox as the user (git + gh credentials, identity) so
-  // the agent inside the VM commits/pushes/opens PRs in their name. Refreshed
-  // credentials are re-injected on every open. Best-effort: without a user
-  // token the sandbox still works via server-mediated installation tokens.
-  const userToken = await getFreshUserToken(userId);
-  if (userToken) {
-    onProgress?.({ phase: 'authenticating', message: 'Signing in to GitHub…' });
-    try {
-      await configureSandboxUserAuth(sandbox, userToken.token, userToken.identity);
-    } catch (error) {
-      console.warn(`[GitHub] Failed to authenticate sandbox as user ${userId}; continuing without.`, error);
-    }
+  // Give the sandbox working git + gh credentials (the fresh installation
+  // token) and the user's commit identity, so the agent inside the VM can
+  // push and open PRs directly. Re-injected with a fresh token on every open;
+  // best-effort — server-mediated git routes mint their own tokens anyway.
+  onProgress?.({ phase: 'authenticating', message: 'Configuring GitHub access…' });
+  try {
+    const identity = await getUserIdentity(userId);
+    await configureSandboxGitAuth(sandbox, token, identity ?? {});
+  } catch (error) {
+    console.warn(`[GitHub] Failed to configure sandbox git credentials for ${userId}; continuing.`, error);
   }
   const result: EnsureResult = {
     resourceId: project.id,
@@ -859,9 +857,9 @@ function buildProjectGitRoutes(): ApiRoute[] {
             const sandbox = await resolveProjectSandbox(sandboxRow);
             // Prefer the connected GitHub identity (links commits to their
             // account); fall back to the WorkOS profile.
-            const userToken = await getFreshUserToken(userId);
-            const identity: GitIdentity = userToken
-              ? { name: userToken.identity.name, email: userToken.identity.email, login: userToken.identity.login }
+            const githubIdentity = await getUserIdentity(userId);
+            const identity: GitIdentity = githubIdentity
+              ? { name: githubIdentity.name, email: githubIdentity.email, login: githubIdentity.login }
               : identityFromUser(getWebAuthUser(loose(c)));
             const result = await commitAll(sandbox, workdir, body.message as string, identity);
             return c.json({ committed: result.committed });
@@ -899,10 +897,7 @@ function buildProjectGitRoutes(): ApiRoute[] {
         try {
           return await withProjectLock(`${project.id}:${userId}`, async () => {
             const sandbox = await resolveProjectSandbox(sandboxRow);
-            // Push as the user when their token is available so the push (and
-            // any commit attribution) is theirs; else push as the app.
-            const userToken = await getFreshUserToken(userId);
-            const token = userToken?.token ?? (await mintInstallationToken(project.installationId));
+            const token = await mintInstallationToken(project.installationId);
             await pushBranch(sandbox, workdir, branch, token, project.repoFullName);
             return c.json({ pushed: true, branch });
           });
@@ -951,10 +946,7 @@ function buildProjectGitRoutes(): ApiRoute[] {
         try {
           return await withProjectLock(`${project.id}:${userId}`, async () => {
             const sandbox = await resolveProjectSandbox(sandboxRow);
-            // Create the PR as the user when their token is available (PR is
-            // authored by them, not the app bot); else fall back to the app.
-            const userToken = await getFreshUserToken(userId);
-            const token = userToken?.token ?? (await mintInstallationToken(project.installationId));
+            const token = await mintInstallationToken(project.installationId);
             const result = await createPullRequest(sandbox, workdir, { token, base, head, title, body: prBody });
             return c.json({ url: result.url });
           });

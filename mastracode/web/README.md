@@ -61,8 +61,8 @@ pnpm web:ui:test  # UI MSW tests (e2e/web-ui)
 
 See `.env.schema` (package root; varlock validates `.env` against it). Minimum: none (runs auth-less, local-only). Auth needs `WORKOS_*`; GitHub needs `GITHUB_APP_*` + auth + `APP_DATABASE_URL`; Railway sandboxes need `RAILWAY_API_TOKEN`. `MASTRACODE_PUBLIC_URL` controls both the WorkOS (`/auth/callback`) and GitHub App (`/auth/github/callback`) redirect URLs.
 
-## Acting as the user
+## Git authentication and attribution
 
-Connecting GitHub stores the user's GitHub App user-to-server token (`github_user_tokens`, one row per WorkOS user, refresh-token aware). On every project open the token is injected into the user's sandbox as persistent credentials — `~/.git-credentials` + `credential.helper store`, `gh` auth, and the GitHub login/noreply git identity — so the agent inside the VM can `git push` / `gh pr create` attributed to the user. Server-mediated commit/push/PR routes prefer the same token and fall back to installation tokens (bot attribution) when none is stored.
+All git writes use short-lived GitHub App **installation tokens** — no user tokens are ever stored. Connecting GitHub captures only the user's GitHub identity (`github_user_identities`: login/name/email, one row per WorkOS user), which sets the git author (`login` + `login@users.noreply.github.com`) so commits are attributed to the user on GitHub even though the app pushes. Pushes and PRs act as the app bot.
 
-Notes: with token expiration enabled on the App, in-VM credentials go stale after ~8h of not re-opening the project (they are refreshed on each open and server git-write). Users who connected before this feature keep bot attribution until they re-connect GitHub. The sandbox is per-(project, user), so a token in a VM is only reachable by its owner's sessions.
+On every project open a freshly minted installation token is injected into the user's sandbox as working credentials — `~/.git-credentials` + `credential.helper store` and `~/.config/gh/hosts.yml` — so the agent inside the VM can `git push` / `gh pr create` directly. Installation tokens expire after ~1h, so long-idle sandboxes need a project re-open before in-VM pushes work again; server-mediated commit/push/PR routes always mint their own token and are unaffected.
