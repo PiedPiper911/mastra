@@ -177,7 +177,7 @@ async function getSandboxWorkspace({
     // Not registered yet.
   }
 
-  const sandbox = await reattachProjectSandbox(sandboxId);
+  const sandbox = await reattachProjectSandbox(sandboxId, { githubProjectId });
   const filesystem = new SandboxFilesystem({ sandbox, workdir: boundWorkdir });
 
   return new Workspace({

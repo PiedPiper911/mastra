@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Capture DB updates without a real Postgres. `getAppDb()` returns a chainable
-// stub whose terminal `.where()` records the `set(...)` payload. Selects
-// resolve to whatever `dbSelectRows` holds.
+// stub whose terminal `.where()` records the `set(...)` payload. Each select
+// consumes the next result set from `dbSelectQueue` (empty array when the
+// queue runs dry), so tests can script sequential queries.
 const dbUpdates: Array<Record<string, unknown>> = [];
-const dbSelectRows: Array<Record<string, unknown>> = [];
+const dbSelectQueue: Array<Array<Record<string, unknown>>> = [];
 vi.mock('./db', () => ({
   getAppDb: () => ({
     update: () => ({
@@ -16,7 +17,7 @@ vi.mock('./db', () => ({
     }),
     select: () => ({
       from: () => ({
-        where: async () => dbSelectRows,
+        where: async () => dbSelectQueue.shift() ?? [],
       }),
     }),
   }),
@@ -97,7 +98,7 @@ function makeRepoInfo(overrides: Partial<RepoMaterializeInfo> = {}): RepoMateria
 
 beforeEach(() => {
   dbUpdates.length = 0;
-  dbSelectRows.length = 0;
+  dbSelectQueue.length = 0;
 });
 
 afterEach(() => {
@@ -272,7 +273,7 @@ describe('ensureProjectSandbox', () => {
 
 describe('reattachProjectSandbox', () => {
   it('reattaches with the row checkpoint name when the provider id is known', async () => {
-    dbSelectRows.push(makeRow({ sandboxId: 'railway-vm-123' }));
+    dbSelectQueue.push([makeRow({ sandboxId: 'railway-vm-123' })]);
     const sandbox = new FakeSandbox();
     let factoryArgs: { providerSandboxId?: string; checkpointName?: string } | undefined;
     setSandboxFactory(opts => {
@@ -289,7 +290,7 @@ describe('reattachProjectSandbox', () => {
   });
 
   it('recovers a dead sandbox from its checkpoint and persists the new provider id', async () => {
-    dbSelectRows.push(makeRow({ sandboxId: 'railway-vm-dead' }));
+    dbSelectQueue.push([makeRow({ sandboxId: 'railway-vm-dead' })]);
     const dead = new FakeSandbox();
     dead.start = async () => {
       throw new Error('sandbox not found');
@@ -307,7 +308,7 @@ describe('reattachProjectSandbox', () => {
   });
 
   it('clears the row and throws sandbox-expired when the replacement is a blank box', async () => {
-    dbSelectRows.push(makeRow({ sandboxId: 'railway-vm-dead' }));
+    dbSelectQueue.push([makeRow({ sandboxId: 'railway-vm-dead' })]);
     const dead = new FakeSandbox();
     dead.start = async () => {
       throw new Error('sandbox not found');
@@ -338,6 +339,55 @@ describe('reattachProjectSandbox', () => {
     setSandboxFactory(() => dead);
 
     await expect(reattachProjectSandbox('railway-vm-unknown')).rejects.toThrow('sandbox not found');
+    expect(dbUpdates).toEqual([]);
+  });
+
+  it('falls back to the project row and reattaches its current provider id when the session id is stale', async () => {
+    // No row matches the stale session id; the project lookup finds the
+    // binding whose sandbox was re-provisioned in the meantime.
+    dbSelectQueue.push([], [makeRow({ sandboxId: 'railway-vm-current' })]);
+    const sandbox = new FakeSandbox();
+    let factoryArgs: { providerSandboxId?: string; checkpointName?: string } | undefined;
+    setSandboxFactory(opts => {
+      factoryArgs = opts;
+      return sandbox;
+    });
+
+    const result = await reattachProjectSandbox('railway-vm-stale', { githubProjectId: 'proj-1' });
+
+    expect(result).toBe(sandbox);
+    expect(factoryArgs?.providerSandboxId).toBe('railway-vm-current');
+    expect(factoryArgs?.checkpointName).toBe('mastracode-web-sbrow-1');
+    expect(dbUpdates).toEqual([]);
+  });
+
+  it('recovers from the checkpoint when both the stale id and the row id are dead', async () => {
+    dbSelectQueue.push([], [makeRow({ sandboxId: 'railway-vm-current' })]);
+    const dead = new FakeSandbox();
+    dead.start = async () => {
+      throw new Error('Railway sandbox railway-vm-current is not running (status: DESTROYED)');
+    };
+    const replacement = new FakeSandbox();
+    replacement.providerId = 'railway-vm-new';
+    setSandboxFactory(opts => (opts.providerSandboxId ? dead : replacement));
+
+    const result = await reattachProjectSandbox('railway-vm-stale', { githubProjectId: 'proj-1' });
+
+    expect(result).toBe(replacement);
+    expect(dbUpdates).toEqual([{ sandboxId: 'railway-vm-new' }]);
+  });
+
+  it('propagates the start failure when neither the id nor the project matches a row', async () => {
+    dbSelectQueue.push([], []);
+    const dead = new FakeSandbox();
+    dead.start = async () => {
+      throw new Error('sandbox not found');
+    };
+    setSandboxFactory(() => dead);
+
+    await expect(reattachProjectSandbox('railway-vm-stale', { githubProjectId: 'proj-gone' })).rejects.toThrow(
+      'sandbox not found',
+    );
     expect(dbUpdates).toEqual([]);
   });
 });

@@ -13,7 +13,19 @@ export interface ReattachedSandbox extends SandboxExec {
   start(): Promise<void>;
 }
 
-export type SandboxReattachFn = (providerSandboxId: string) => Promise<ReattachedSandbox>;
+/**
+ * Extra context for reattaching. `githubProjectId` lets the implementation
+ * recover when the session's persisted `providerSandboxId` is stale (the
+ * binding was re-provisioned or cleared since the session captured it).
+ */
+export interface SandboxReattachContext {
+  githubProjectId?: string;
+}
+
+export type SandboxReattachFn = (
+  providerSandboxId: string,
+  context?: SandboxReattachContext,
+) => Promise<ReattachedSandbox>;
 
 let reattachFn: SandboxReattachFn | undefined;
 
@@ -23,11 +35,14 @@ export function registerSandboxReattach(fn: SandboxReattachFn): void {
 }
 
 /** Reattach to an already-provisioned sandbox by provider id. */
-export async function reattachProjectSandbox(providerSandboxId: string): Promise<ReattachedSandbox> {
+export async function reattachProjectSandbox(
+  providerSandboxId: string,
+  context?: SandboxReattachContext,
+): Promise<ReattachedSandbox> {
   if (!reattachFn) {
     throw new Error(
       'No sandbox reattach implementation registered. Sandbox-backed workspaces are only available when the web surface has called registerSandboxReattach().',
     );
   }
-  return reattachFn(providerSandboxId);
+  return reattachFn(providerSandboxId, context);
 }

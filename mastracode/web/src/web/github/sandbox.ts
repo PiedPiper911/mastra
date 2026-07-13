@@ -331,10 +331,20 @@ export async function teardownProjectSandbox(
   }
 }
 
+/** Extra context for {@link reattachProjectSandbox} when the caller has it. */
+export interface ReattachContext {
+  githubProjectId?: string;
+}
+
 /**
  * Reattach to an already-provisioned sandbox by its provider id and start it.
  * Used by the workspace seam when opening a GitHub project that was already
  * materialized (sandbox id + workdir carried on controller state).
+ *
+ * The session's persisted provider id can be stale: the binding may have been
+ * re-provisioned (new id) or torn down since the session captured it. When the
+ * id matches no row, fall back to the project's binding row (via
+ * `context.githubProjectId`) and reattach to its *current* provider id.
  *
  * When the VM is gone (provider idle GC), recover instead of failing the
  * session: provision a replacement restored from the row's checkpoint, verify
@@ -342,17 +352,35 @@ export async function teardownProjectSandbox(
  * no checkpoint exists (blank replacement box) does this throw — the SPA's
  * `/ensure` flow re-materializes the repo on the next project open.
  */
-export async function reattachProjectSandbox(providerSandboxId: string): Promise<MaterializationSandbox> {
+export async function reattachProjectSandbox(
+  providerSandboxId: string,
+  context?: ReattachContext,
+): Promise<MaterializationSandbox> {
   const idleTimeoutMinutes = getSandboxIdleMinutes();
   const rows = await getAppDb()
     .select()
     .from(githubProjectSandboxes)
     .where(eq(githubProjectSandboxes.sandboxId, providerSandboxId));
-  const row = rows[0];
+  let row = rows[0];
+
+  if (!row && context?.githubProjectId) {
+    // Stale session id — resolve the project's binding row directly. Prefer a
+    // row with a live provider id; threads for a GitHub project share its
+    // sandbox bindings under the current resource-scoping model.
+    const candidates = await getAppDb()
+      .select()
+      .from(githubProjectSandboxes)
+      .where(eq(githubProjectSandboxes.githubProjectId, context.githubProjectId));
+    row = candidates.find(r => r.sandboxId) ?? candidates[0];
+  }
+
+  // Reattach to the row's current provider id when it has one — it may be
+  // newer than the id the session captured.
+  const reattachId = row?.sandboxId ?? providerSandboxId;
   const checkpointName = row ? sandboxCheckpointName(row) : undefined;
 
   const sandbox = sandboxFactory({
-    providerSandboxId,
+    providerSandboxId: reattachId,
     idleTimeoutMinutes,
     ...(checkpointName ? { checkpointName } : {}),
   });
