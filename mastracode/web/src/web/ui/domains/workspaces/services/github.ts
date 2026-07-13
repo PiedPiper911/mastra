@@ -144,7 +144,15 @@ export interface MaterializeResult {
 
 /** A coarse-grained step of the server-side sandbox preparation. */
 export interface PrepareProgress {
-  phase: 'reattaching' | 'provisioning' | 'preparing-workspace' | 'cloning' | 'pulling' | 'finalizing' | 'done';
+  phase:
+    | 'reattaching'
+    | 'provisioning'
+    | 'preparing-workspace'
+    | 'cloning'
+    | 'pulling'
+    | 'authenticating'
+    | 'finalizing'
+    | 'done';
   message: string;
 }
 

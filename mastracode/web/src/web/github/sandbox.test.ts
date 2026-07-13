@@ -27,6 +27,7 @@ import {
   computeSandboxWorkdir,
   computeWorktreePath,
   configureGitIdentity,
+  configureSandboxUserAuth,
   createPullRequest,
   ensureProjectSandbox,
   ensureWorktree,
@@ -666,6 +667,54 @@ describe('configureGitIdentity', () => {
     const err = await configureGitIdentity(sandbox, '/workspace/hello', { login: 'octocat' }).catch(e => e);
     expect(err).toBeInstanceOf(MaterializeError);
     expect(err.code).toBe('commit-failed');
+  });
+});
+
+describe('configureSandboxUserAuth', () => {
+  const identity = { login: 'octocat', name: 'Octo Cat', email: null };
+
+  it('writes 0600 git credentials, credential helper, and global identity', async () => {
+    const sandbox = new FakeSandbox();
+    await configureSandboxUserAuth(sandbox, 'ghu_tok', identity);
+
+    const gitScript = sandbox.calls[0]!;
+    expect(gitScript).toContain('umask 077');
+    expect(gitScript).toContain(`'https://x-access-token:ghu_tok@github.com' > ~/.git-credentials`);
+    expect(gitScript).toContain('chmod 600 ~/.git-credentials');
+    expect(gitScript).toContain('git config --global credential.helper store');
+    expect(gitScript).toContain(`git config --global user.name 'Octo Cat'`);
+    expect(gitScript).toContain(`git config --global user.email 'octocat@users.noreply.github.com'`);
+  });
+
+  it('seeds gh via auth login with the quoted token', async () => {
+    const sandbox = new FakeSandbox();
+    await configureSandboxUserAuth(sandbox, `ghu'; rm -rf / #`, identity);
+
+    const ghCall = sandbox.calls.find(c => c.includes('gh auth login'));
+    expect(ghCall).toBe(`printf '%s' 'ghu'\\''; rm -rf / #' | gh auth login --hostname github.com --with-token`);
+    // gh login succeeded — no hosts.yml fallback.
+    expect(sandbox.calls.join('\n')).not.toContain('hosts.yml');
+  });
+
+  it('falls back to writing hosts.yml when gh auth login fails', async () => {
+    const sandbox = new FakeSandbox(script =>
+      script.includes('gh auth login') ? { exitCode: 1, stdout: '', stderr: 'gh: command not found' } : OK,
+    );
+    await configureSandboxUserAuth(sandbox, 'ghu_tok', identity);
+
+    const fallback = sandbox.calls.find(c => c.includes('hosts.yml'))!;
+    expect(fallback).toContain('mkdir -p ~/.config/gh');
+    expect(fallback).toContain('oauth_token: ghu_tok');
+    expect(fallback).toContain('user: octocat');
+  });
+
+  it('surfaces user-auth-failed when the git credential setup fails', async () => {
+    const sandbox = new FakeSandbox(script =>
+      script.includes('.git-credentials') ? { exitCode: 1, stdout: '', stderr: 'read-only fs' } : OK,
+    );
+    const err = await configureSandboxUserAuth(sandbox, 'ghu_tok', identity).catch(e => e);
+    expect(err).toBeInstanceOf(MaterializeError);
+    expect(err.code).toBe('user-auth-failed');
   });
 });
 

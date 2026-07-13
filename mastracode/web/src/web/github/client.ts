@@ -364,9 +364,31 @@ export function buildOAuthIdentifyUrl(state: string, redirectUri: string): strin
 }
 
 /**
- * Exchange an OAuth `code` for a user access token.
+ * A user-to-server token set from GitHub's OAuth token endpoint. When the App
+ * has "Expire user authorization tokens" enabled, GitHub returns a
+ * `refresh_token` and expiries; when disabled, only `accessToken` is present
+ * and the token does not expire.
  */
-export async function exchangeOAuthCode(code: string, redirectUri: string): Promise<string> {
+export interface UserTokenSet {
+  accessToken: string;
+  refreshToken?: string;
+  /** Absolute expiry of `accessToken`; undefined when the token doesn't expire. */
+  expiresAt?: Date;
+  /** Absolute expiry of `refreshToken`; undefined when not applicable. */
+  refreshTokenExpiresAt?: Date;
+}
+
+interface OAuthTokenResponse {
+  access_token?: string;
+  expires_in?: number;
+  refresh_token?: string;
+  refresh_token_expires_in?: number;
+  error?: string;
+  error_description?: string;
+}
+
+/** POST to GitHub's OAuth token endpoint and parse the token-set response. */
+async function requestUserToken(body: Record<string, string>, what: string): Promise<UserTokenSet> {
   const config = requireConfig();
   const res = await fetch('https://github.com/login/oauth/access_token', {
     method: 'POST',
@@ -375,18 +397,54 @@ export async function exchangeOAuthCode(code: string, redirectUri: string): Prom
     body: JSON.stringify({
       client_id: config.clientId,
       client_secret: config.clientSecret,
-      code,
-      redirect_uri: redirectUri,
+      ...body,
     }),
   });
   if (!res.ok) {
-    throw new Error(`GitHub OAuth token exchange failed: ${res.status}`);
+    throw new Error(`GitHub OAuth ${what} failed: ${res.status}`);
   }
-  const data = (await res.json()) as { access_token?: string; error?: string; error_description?: string };
+  const data = (await res.json()) as OAuthTokenResponse;
   if (!data.access_token) {
-    throw new Error(
-      `GitHub OAuth token exchange returned no token: ${data.error_description ?? data.error ?? 'unknown'}`,
-    );
+    throw new Error(`GitHub OAuth ${what} returned no token: ${data.error_description ?? data.error ?? 'unknown'}`);
   }
-  return data.access_token;
+  const now = Date.now();
+  return {
+    accessToken: data.access_token,
+    ...(data.refresh_token ? { refreshToken: data.refresh_token } : {}),
+    ...(typeof data.expires_in === 'number' ? { expiresAt: new Date(now + data.expires_in * 1000) } : {}),
+    ...(typeof data.refresh_token_expires_in === 'number'
+      ? { refreshTokenExpiresAt: new Date(now + data.refresh_token_expires_in * 1000) }
+      : {}),
+  };
+}
+
+/**
+ * Exchange an OAuth `code` for a user token set.
+ */
+export async function exchangeOAuthCode(code: string, redirectUri: string): Promise<UserTokenSet> {
+  return requestUserToken({ code, redirect_uri: redirectUri }, 'token exchange');
+}
+
+/**
+ * Refresh an expiring user-to-server token using its refresh token.
+ */
+export async function refreshUserToken(refreshToken: string): Promise<UserTokenSet> {
+  return requestUserToken({ grant_type: 'refresh_token', refresh_token: refreshToken }, 'token refresh');
+}
+
+/** GitHub identity of the user a token belongs to. */
+export interface GithubUserProfile {
+  login: string;
+  name: string | null;
+  email: string | null;
+}
+
+/**
+ * Fetch the authenticated user's GitHub profile (`GET /user`) via their token.
+ * The email is the public profile email and may be null.
+ */
+export async function getAuthenticatedGithubUser(userToken: string): Promise<GithubUserProfile> {
+  const octokit = getUserOctokit(userToken);
+  const { data } = await octokit.users.getAuthenticated();
+  return { login: data.login, name: data.name ?? null, email: data.email ?? null };
 }

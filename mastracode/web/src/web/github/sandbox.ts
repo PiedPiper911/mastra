@@ -51,7 +51,15 @@ export interface MaterializationSandbox {
  * user-facing copy.
  */
 export interface PrepareProgress {
-  phase: 'reattaching' | 'provisioning' | 'preparing-workspace' | 'cloning' | 'pulling' | 'finalizing' | 'done';
+  phase:
+    | 'reattaching'
+    | 'provisioning'
+    | 'preparing-workspace'
+    | 'cloning'
+    | 'pulling'
+    | 'authenticating'
+    | 'finalizing'
+    | 'done';
   message: string;
 }
 
@@ -451,7 +459,8 @@ export class MaterializeError extends Error {
       | 'commit-failed'
       | 'gh-missing'
       | 'pr-failed'
-      | 'sandbox-expired',
+      | 'sandbox-expired'
+      | 'user-auth-failed',
   ) {
     super(message);
     this.name = 'MaterializeError';
@@ -696,6 +705,83 @@ export async function configureGitIdentity(
   const setEmail = await sh(sandbox, `git -C ${shellQuote(workdir)} config user.email ${shellQuote(email)}`);
   if (setEmail.exitCode !== 0) {
     throw new MaterializeError(`Failed to set git user.email: ${setEmail.stderr.trim()}`, 'commit-failed');
+  }
+}
+
+/** GitHub identity of the connected user, injected into their sandbox. */
+export interface SandboxUserIdentity {
+  login: string;
+  name: string | null;
+  email: string | null;
+}
+
+/**
+ * Authenticate the user's sandbox as *them*: persistent git + `gh` credentials
+ * plus their GitHub identity for authorship, so the agent inside the VM can
+ * `git push` / `gh pr create` attributed to the user.
+ *
+ * - `~/.git-credentials` (0600) + `credential.helper store` authenticates any
+ *   https git operation against github.com.
+ * - `gh auth login --with-token` seeds the GitHub CLI; when `gh` is missing or
+ *   the login fails, `~/.config/gh/hosts.yml` is written directly so a later
+ *   `gh` install still picks the token up.
+ * - Global `user.name`/`user.email` use the GitHub login/noreply identity so
+ *   commits link to the user's account.
+ *
+ * Idempotent: files are overwritten wholesale, so re-running with a fresh
+ * token on every project open rotates the credentials in place. The sandbox is
+ * per-(project,user), so the token is only ever reachable by its owner.
+ */
+export async function configureSandboxUserAuth(
+  sandbox: MaterializationSandbox,
+  token: string,
+  identity: SandboxUserIdentity,
+): Promise<void> {
+  const { name, email } = resolveGitIdentity(identity);
+  const credentialLine = `https://x-access-token:${token}@github.com`;
+
+  const gitScript = [
+    `umask 077`,
+    `printf '%s\\n' ${shellQuote(credentialLine)} > ~/.git-credentials`,
+    `chmod 600 ~/.git-credentials`,
+    `git config --global credential.helper store`,
+    `git config --global user.name ${shellQuote(name)}`,
+    `git config --global user.email ${shellQuote(email)}`,
+  ].join(' && ');
+  const gitResult = await sh(sandbox, gitScript);
+  if (gitResult.exitCode !== 0) {
+    throw new MaterializeError(
+      `Failed to configure sandbox git credentials: ${gitResult.stderr.trim()}`,
+      'user-auth-failed',
+    );
+  }
+
+  // Seed the GitHub CLI. `gh auth login --with-token` validates the token
+  // against the API; when gh is missing or validation fails (e.g. restricted
+  // egress at setup time), fall back to writing hosts.yml directly — gh reads
+  // it on next use.
+  const ghLogin = await sh(
+    sandbox,
+    `printf '%s' ${shellQuote(token)} | gh auth login --hostname github.com --with-token`,
+  );
+  if (ghLogin.exitCode !== 0) {
+    const hostsYml = [
+      `github.com:`,
+      `    oauth_token: ${token}`,
+      `    user: ${identity.login}`,
+      `    git_protocol: https`,
+      ``,
+    ].join('\n');
+    const fallback = await sh(
+      sandbox,
+      `umask 077 && mkdir -p ~/.config/gh && printf '%s' ${shellQuote(hostsYml)} > ~/.config/gh/hosts.yml`,
+    );
+    if (fallback.exitCode !== 0) {
+      throw new MaterializeError(
+        `Failed to configure sandbox gh credentials: ${fallback.stderr.trim()}`,
+        'user-auth-failed',
+      );
+    }
   }
 }
 
