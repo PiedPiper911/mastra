@@ -218,3 +218,40 @@ describe('client observability carrier propagation', () => {
     });
   });
 });
+
+describe('finish chunk usage resolution (both paths)', () => {
+  it('reads usage from payload.usage when the output wrapper is absent (broadcastPersistedSignal)', () => {
+    const result = convertMastraChunkToAISDKv5({
+      chunk: {
+        type: 'finish',
+        runId: 'run-1',
+        from: ChunkFrom.AGENT,
+        payload: {
+          stepResult: { reason: 'stop' },
+          usage: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
+        },
+        metadata: {},
+      } as any,
+    });
+
+    expect(result.type).toBe('finish');
+    expect((result as any).totalUsage).toEqual({ promptTokens: 10, completionTokens: 20, totalTokens: 30 });
+  });
+
+  it('reads usage from payload.output.usage for a normal FinishPayload', () => {
+    const result = convertMastraChunkToAISDKv5({
+      chunk: {
+        type: 'finish',
+        runId: 'run-1',
+        from: ChunkFrom.AGENT,
+        payload: {
+          stepResult: { reason: 'stop' },
+          output: { usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 } },
+        },
+        metadata: {},
+      } as any,
+    });
+
+    expect((result as any).totalUsage).toEqual({ promptTokens: 1, completionTokens: 2, totalTokens: 3 });
+  });
+});
